@@ -1,0 +1,67 @@
+# staging の Worker が共用する DB: Durable Object `StagingDb` の中で PGlite を動かす (Refs ohishi-exp/rust-leave-worker#1)。
+# 利用側は env.staging から DO binding (name = "STAGING_DB", class_name = "StagingDb", script_name = "alc-staging-db-staging")
+# で参照し、`Stub::connect` で繋ぐ (README)。
+#
+# 外から届く口を持たない: HTTP の fetch は常に 404。トップレベルも env.staging も workers_dev = false /
+# preview_urls = false、route / routes / custom_domain を書かない (scripts/check-exposure.sh が --private で検査する)。
+# DO の connect 口に認可は無い (受け入れている前提は README の「connect 口の認可」)。
+# 配信は main への push で deploy.yml が env.staging にだけ行う。トップレベルは配信しない
+# (トップレベルに durable_objects・migrations を置かない = env なしの wrangler deploy で 2 つ目の DB を作らせない)。
+name = "alc-staging-db"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+# migration の SQL を ALC_MIGRATIONS_REV の版で取り出して .alc-migrations/bundle.json にまとめ、node で起動〜検査を 1 回通して
+# .prebuilt/ (書き換えた pglite.wasm・空の datadir・実行時にコンパイルされる wasm) を作る
+[build]
+command = "bash scripts/fetch-migrations.sh && node scripts/gen-prebuilt-wasm.mjs"
+
+# PGlite の wasm は CompiledWasm (既定の規則)、pglite.data (postgres の share 等の fs bundle) と initdb 済みの datadir
+# (.prebuilt/datadir.tar.gz) は ArrayBuffer で同梱する
+[[rules]]
+type = "Data"
+globs = ["**/*.data", "**/*.tar.gz"]
+fallthrough = true
+
+# PGlite は wasm・data を渡しても `new URL("./pglite.data", import.meta.url)` を無条件に作る。Workers の bundle では
+# import.meta.url が URL にならず "Invalid URL string." で起動が止まるので、取りに行かない仮の base を与える
+[define]
+"import.meta.url" = '"https://pglite.invalid/"'
+"process.versions.node" = "undefined"
+"self.location.href" = '"https://pglite.invalid/"'
+
+# PGlite は node で動くときだけ node の組み込みを動的 import する。nodejs_compat を付けると `process.versions.node` が
+# 在って node の経路 (createRequire・process.binding) に入り起動できないので、付けずに組み込みを空のモジュールへ向ける
+[alias]
+"fs" = "./src/node-stub.js"
+"fs/promises" = "./src/node-stub.js"
+"module" = "./src/node-stub.js"
+"stream" = "./src/node-stub.js"
+"stream/promises" = "./src/node-stub.js"
+"util" = "./src/node-stub.js"
+"zlib" = "./src/node-stub.js"
+
+[env.staging]
+name = "alc-staging-db-staging"
+workers_dev = false
+preview_urls = false
+
+[env.staging.observability]
+enabled = true
+
+# define も env に継承されない (トップレベルの [define] と同じ値)
+[env.staging.define]
+"import.meta.url" = '"https://pglite.invalid/"'
+"process.versions.node" = "undefined"
+"self.location.href" = '"https://pglite.invalid/"'
+
+# env は継承しないので DO binding と migrations は env.staging に書く
+[[env.staging.durable_objects.bindings]]
+name = "STAGING_DB"
+class_name = "StagingDb"
+
+[[env.staging.migrations]]
+tag = "v1"
+new_sqlite_classes = ["StagingDb"]

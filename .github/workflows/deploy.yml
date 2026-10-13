@@ -1,0 +1,74 @@
+name: Deploy
+
+# staging 共用の DB の配信。ci.yml とは別 workflow。
+#   - main への push   → staging (--env staging)
+#   - pull_request     → wrangler deploy --dry-run だけ (secret 不要。この workflow 自体の検証)
+# 本番は無い (トップレベルは配信しない。tag の配信も置かない)。
+# account_id は書かない (CLOUDFLARE_API_TOKEN から決まる)。wrangler の出力はファイルに取り、mask してから伏せて出す。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  # package.json の wrangler と揃える
+  WRANGLER_VERSION: 4.145.0
+
+jobs:
+  dry-run:
+    name: wrangler deploy --dry-run
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-exposure.sh --private wrangler.toml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --no-audit --no-fund
+      - run: npx -y "wrangler@${WRANGLER_VERSION}" deploy --dry-run --env staging
+
+  deploy-staging:
+    name: deploy staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: staging-db-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      # ci.yml は別 workflow で needs にできないので、配信の前の検査をここでも回す
+      - run: bash scripts/check-exposure.sh --private wrangler.toml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --no-audit --no-fund
+      # wrangler の出力は $RUNNER_TEMP/deploy.log に取り、伏せてから出す (ログファイルそのものは出さない)。
+      #   - 32 桁の hex (account ID 等): ::add-mask:: + <account> に置換
+      #   - workers.dev のホスト名: ::add-mask:: + <workers-dev> に置換 (workers_dev = false なので出ないはず)
+      - name: wrangler deploy --env staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          log="$RUNNER_TEMP/deploy.log"
+          status=0
+          npx -y "wrangler@${WRANGLER_VERSION}" deploy --env staging \
+            --tag "staging-${GITHUB_SHA::7}" --message "$GITHUB_SHA" >"$log" 2>&1 || status=$?
+          # 何かを出す前に mask を登録する
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          grep -oE '[A-Za-z0-9.-]+\.workers\.dev' "$log" | sort -u | while read -r host; do
+            echo "::add-mask::${host}"
+          done
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<workers-dev>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          [ "$status" = 0 ] || exit "$status"
+          # workers_dev = false なので workers.dev の URL は出ないはず (出たら公開されている)
+          if grep -qE '[A-Za-z0-9.-]+\.workers\.dev' "$log"; then
+            echo "::error::workers.dev の URL が付いた (workers_dev = false のはず。直ちに止めること)"
+            exit 1
+          fi

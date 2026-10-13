@@ -1,0 +1,52 @@
+name: CI
+
+# staging 共用の DB (Durable Object `StagingDb` の中の PGlite) の検査。配信は deploy.yml (別 workflow)。
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # PR の古い run は捨てるが、main は途中で切らない
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: check (exposure / typecheck / dry-run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 外から届く口が無いこと (どの env も workers_dev / preview_urls = false、route 無し、トップレベルに DO 無し)
+      - name: 外から直接届かないことの検査 (wrangler.toml)
+        run: bash scripts/check-exposure.sh --private wrangler.toml
+      - name: check-exposure.sh の陰性対照
+        run: bash scripts/check-exposure-test.sh --private wrangler.toml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # lockfile は commit しない (package.json で exact に固定) ので npm ci は使えない
+      - run: npm install --no-audit --no-fund
+      - run: npm run typecheck
+      # [build] が alc-migrations を ALC_MIGRATIONS_REV の版で取り、node で起動 → migration 全量 → staging 専用の SQL →
+      # RLS 付きの書き・読みを 1 回通してから wasm と datadir を作る (scripts/gen-prebuilt-wasm.mjs)。rev を上げて壊れたらここで落ちる
+      - name: wrangler deploy --dry-run --env staging
+        run: npx wrangler deploy --dry-run --env staging
+
+  # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)
+  auto-merge:
+    name: Auto Merge
+    needs: [check]
+    if: github.event_name == 'pull_request' && needs.check.result == 'success'
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      # 無いと startup_failure になる
+      checks: read
+    secrets:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
