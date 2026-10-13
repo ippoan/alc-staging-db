@@ -50,7 +50,7 @@ staging の利用者の tenant_id は揮発する (DB が起きるたびに空) 
 - 関数 `alc_api.staging_ensure_tenant()` (trigger、`SECURITY DEFINER`、`SET search_path = alc_api`、所有者は起動を流す superuser):
   `NEW.tenant_id` が tenants に無ければ `(id, name) = (NEW.tenant_id, 'staging')` の行を作る
 - `alc_api.tenants(id)` を指す外部キーを持つ alc_api の表すべてに
-  `BEFORE INSERT OR UPDATE OF tenant_id … FOR EACH ROW` で張る (rev 57a2775 で 68 表)。
+  `BEFORE INSERT OR UPDATE OF tenant_id … FOR EACH ROW` で張る (rev a7d0c20 で 69 表)。
   tenant_id 以外の列の外部キーが見つかったら起動を失敗させる
 
 ⇒ 利用側は tenants に無い tenant_id のまま leave_settings・users 等へ書いてよい (外部キー違反にならない)。
@@ -87,7 +87,7 @@ script_name = "alc-staging-db-staging"
 `ALC_MIGRATIONS_REV` の 1 行 (ippoan/alc-migrations の commit SHA) だけを書き換える。`wrangler.toml` の `[build]` が
 `scripts/fetch-migrations.sh` でその版を取り (写しは commit しない)、`scripts/gen-prebuilt-wasm.mjs` が node で
 起動 → migration 全量 → staging 専用の SQL → alc_api_rt での書き・読み (RLS) を 1 回通す。CI の dry-run が通れば、merge で
-staging へ配信される。今の版は 57a2775 (migration 172 まで。001〜172 のうち 133 は欠番で 171 本)。
+staging へ配信される。今の版は a7d0c20 (migration 173 まで。001〜173 のうち 133 は欠番で 172 本)。
 
 ## 128 MB に収めるために
 
