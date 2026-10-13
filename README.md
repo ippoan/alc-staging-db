@@ -31,15 +31,6 @@ staging の Worker (vein / leave / dtako / trouble / notify / lineworks) が共�
 (`frame` / `start` / `exec` / `role` / `write`) が付く。利用側が Terminate を送らずに切った接続 (tokio-postgres の Client を
 drop したまま invocation が終わる形。read が TypeError「client disconnected」で落ちる) はエラーにせず、通常の終了として扱う。
 
-**診断ログ (白黒が付いたら別 PR で削る)**: 「取り込んだページが見えない」の切り分け用 (Refs ohishi-exp/rust-leave-worker#1)。
-DO の起動で `{"staging_db":"boot","inst":…}`、ready に `inst` (DO のインスタンスの印) と `gen` (PGlite を作った回数)、
-接続ごとに終わるとき 1 行 `{"staging_db":"conn","inst","gen","seq","wait_ms","msgs":{種別:件数},"tags":[CommandComplete の tag],
-"errors":[SQLSTATE],"rfq":"I|T|E","end":"terminate|disconnect|idle|eof|error","rolled_back","bind_ts_age_s":[…],"pages",
-"tenants","received_age_s":[最小,最大],"bind_uuid_in_pages":[…]}`。
-`pages` (leave_pages の全 tenant の総数)・`tenants` (tenant_id の種類数)・`received_age_s` (now() − received_at の秒) は終了処理
-(ROLLBACK・RESET) の後に superuser に戻して数え、失敗したら `pages: null`。`bind_ts_age_s` は Bind で届いた時刻の引数の now − 値 (秒)、
-`bind_uuid_in_pages` は Bind で届いた uuid の引数ごとに「その値の tenant_id の行が leave_pages に在るか」(値はログに出さない)。
-
 ## 接続
 
 - 接続は 1 本ずつ直列に捌く。前の接続が閉じるのを **20 秒**待っても順番が来なければ、新しい接続を閉じる
@@ -63,6 +54,9 @@ staging の利用者の tenant_id は揮発する (DB が起きるたびに空) 
   tenant_id 以外の列の外部キーが見つかったら起動を失敗させる
 
 ⇒ 利用側は tenants に無い tenant_id のまま leave_settings・users 等へ書いてよい (外部キー違反にならない)。
+
+staging の利用者の tenant_id は揮発する (rust-alc-api staging の DB 次第)。機械用資格情報は発行時の tenant に紐づくので、
+利用者の tenant が変わったら発行し直す (古い tenant のまま取り込むと、行は入るが今の利用者の一覧には出ない)。
 
 ## connect 口の認可
 

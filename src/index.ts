@@ -25,7 +25,6 @@ import dataDir from "../.prebuilt/datadir.tar.gz";
 // scripts/fetch-migrations.sh が ALC_MIGRATIONS_REV の版から作る (commit しない)
 import bundle from "../.alc-migrations/bundle.json";
 import { PGLITE_INITIAL_MIB, POSTGRESQL_CONF, RUNTIME_ROLE, setupSteps } from "./steps.js";
-import { ConnStats, type Snapshot } from "./diag";
 import { installWasmShim } from "./wasm-shim";
 
 const SSL_REQUEST = 80877103;
@@ -54,8 +53,7 @@ function logError(at: string, e: unknown, step?: string): void {
 }
 
 /// 起動から migration・staging 専用の SQL までを流す。成功したら 1 行だけ出す
-/// (`inst` は DO のインスタンス、`gen` はその中で PGlite を作った回数。診断用)
-async function start(inst: string, gen: number): Promise<PGlite> {
+async function start(): Promise<PGlite> {
   const started = Date.now();
   let db: PGlite | undefined;
   try {
@@ -79,14 +77,7 @@ async function start(inst: string, gen: number): Promise<PGlite> {
       if (s.migration) migrations += 1;
     }
     console.log(
-      JSON.stringify({
-        staging_db: "ready",
-        inst,
-        gen,
-        rev: bundle.rev.slice(0, 7),
-        migrations,
-        ms: Date.now() - started,
-      }),
+      JSON.stringify({ staging_db: "ready", rev: bundle.rev.slice(0, 7), migrations, ms: Date.now() - started }),
     );
     return db;
   } catch (e) {
@@ -127,41 +118,6 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
 
 const IDLE = Symbol("idle");
 
-/// 診断用: 接続の終了処理 (ROLLBACK・RESET) の後に superuser に戻して leave_pages を数える (件数・種類数・秒だけ)。
-/// PGlite では RESET SESSION AUTHORIZATION が効かないため名指しで戻す。次の接続は頭で alc_api_rt にし直す。
-/// 失敗しても null を返すだけで、終了処理を止めない
-async function snapshot(db: PGlite, stats: ConnStats): Promise<Snapshot | null> {
-  try {
-    if (db.isInTransaction()) return null;
-    await db.exec("SET SESSION AUTHORIZATION postgres");
-    const r = await db.query<{ n: number; t: number; young: number | null; old: number | null }>(
-      `SELECT count(*)::int AS n, count(DISTINCT tenant_id)::int AS t,
-              floor(extract(epoch FROM now() - max(received_at)))::int AS young,
-              floor(extract(epoch FROM now() - min(received_at)))::int AS old
-         FROM alc_api.leave_pages`,
-    );
-    const row = r.rows[0];
-    if (!row) return null;
-    // Bind で届いた uuid ごとに、その値の tenant_id の行が在るか (値は出さない)
-    const inPages: boolean[] = [];
-    for (const u of stats.bindUuids()) {
-      const e = await db.query<{ e: boolean }>(
-        "SELECT EXISTS (SELECT 1 FROM alc_api.leave_pages WHERE tenant_id = $1::uuid) AS e",
-        [u],
-      );
-      inPages.push(e.rows[0]?.e === true);
-    }
-    return {
-      pages: row.n,
-      tenants: row.t,
-      received_age_s: row.young === null ? [] : [row.young, row.old ?? row.young],
-      bind_uuid_in_pages: inPages,
-    };
-  } catch {
-    return null;
-  }
-}
-
 /// read を IDLE_LIMIT_MS で打ち切る (打ち切ったら IDLE)
 async function readWithin<T>(read: Promise<T>): Promise<T | typeof IDLE> {
   let timer: number | null = null;
@@ -179,15 +135,6 @@ export class StagingDb extends DurableObject {
   private db: Promise<PGlite> | null = null;
   /// 接続を 1 本ずつに直列化する鎖
   private queue: Promise<void> = Promise.resolve();
-  /// 診断用: この DO のインスタンスの印 (起動の 1 行・接続ごとの 1 行に出す)、PGlite を作った回数、接続の通し番号
-  private readonly inst = crypto.randomUUID().slice(0, 6);
-  private gen = 0;
-  private seq = 0;
-
-  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
-    super(ctx, env);
-    console.log(JSON.stringify({ staging_db: "boot", inst: this.inst }));
-  }
 
   async fetch(): Promise<Response> {
     return new Response("not found", { status: 404 });
@@ -198,8 +145,6 @@ export class StagingDb extends DurableObject {
     // (socket.close だけでは、connect が返るまで接続側に閉じたことが届かないことがある)
     let expired = false;
     let timer: number | null = null;
-    const seq = ++this.seq;
-    const queued = Date.now();
     const timedOut = new Promise<void>((resolve) => {
       timer = setTimeout(() => {
         expired = true;
@@ -210,7 +155,7 @@ export class StagingDb extends DurableObject {
     });
     const turn = this.queue.then(() => {
       clearTimeout(timer);
-      return expired ? undefined : this.serve(socket, new ConnStats(seq, Date.now() - queued));
+      return expired ? undefined : this.serve(socket);
     });
     this.queue = turn.catch(() => {});
     return Promise.race([turn, timedOut]);
@@ -218,7 +163,7 @@ export class StagingDb extends DurableObject {
 
   /// 最初の接続で起動する。起動に失敗したら次の接続で起動し直す
   private async ready(): Promise<PGlite> {
-    this.db ??= start(this.inst, ++this.gen);
+    this.db ??= start();
     try {
       return await this.db;
     } catch (e) {
@@ -227,7 +172,7 @@ export class StagingDb extends DurableObject {
     }
   }
 
-  private async serve(socket: Socket, stats: ConnStats): Promise<void> {
+  private async serve(socket: Socket): Promise<void> {
     const writer = socket.writable.getWriter();
     const reader = socket.readable.getReader();
     // PGlite は、最初の postgres のメッセージ (StartupMessage) が届いてから起動する (postgres でない接続では起動しない)
@@ -245,12 +190,10 @@ export class StagingDb extends DurableObject {
           // 利用側が Terminate を送らずに切った (tokio-postgres の Client を drop したまま invocation が終わる形)。
           // read は TypeError「client disconnected」で落ちるが、応答は返し終えているので通常の終了として扱う
           // (エラーに出すと commit の取り消しに見える。実際は取り消さない — 開いた transaction だけ finally で ROLLBACK)
-          stats.end = "disconnect";
           break;
         }
         if (r === IDLE) {
           console.log(JSON.stringify({ staging_db: "error", at: "connection", kind: "idle" }));
-          stats.end = "idle";
           break;
         }
         if (r.done) break;
@@ -261,7 +204,6 @@ export class StagingDb extends DurableObject {
           if (!next) break;
           const message = buf.slice(0, next.len);
           buf = buf.slice(next.len);
-          stats.received(startup && next.kind === "msg" ? "startup" : next.kind, message);
           if (next.kind === "ssl") {
             step = "write";
             await writer.write(new TextEncoder().encode("N"));
@@ -269,10 +211,7 @@ export class StagingDb extends DurableObject {
           }
           if (next.kind === "cancel") continue;
           // Terminate: PGlite には渡さずにここで閉じる (後片付けは finally)
-          if (!startup && message[0] === 0x58) {
-            stats.end = "terminate";
-            break read;
-          }
+          if (!startup && message[0] === 0x58) break read;
           step = "start";
           db ??= await this.ready();
           const pg = db;
@@ -287,29 +226,23 @@ export class StagingDb extends DurableObject {
             // 応答 (AuthenticationOk … ReadyForQuery) を返す前に、この接続を実行用ロールにする
             await db.exec(`SET SESSION AUTHORIZATION ${RUNTIME_ROLE}`);
           }
-          stats.sent(out);
           step = "write";
           for (const chunk of out) await writer.write(chunk);
         }
       }
     } catch (e) {
-      stats.end = "error";
       logError("connection", e, step);
     } finally {
       // 次の接続へ持ち越さない: 開いたままの transaction と SET を戻す。PGlite では RESET SESSION AUTHORIZATION が
       // 効かない (ロールは変わらない) が、次の接続は頭で必ず SET SESSION AUTHORIZATION alc_api_rt をし直す
       try {
         if (db) {
-          if (db.isInTransaction()) {
-            await db.exec("ROLLBACK");
-            stats.rolledBack = true;
-          }
+          if (db.isInTransaction()) await db.exec("ROLLBACK");
           await db.exec("RESET ALL; RESET SESSION AUTHORIZATION;");
         }
       } catch (e) {
         logError("reset", e);
       }
-      console.log(stats.line(this.inst, this.gen, db ? await snapshot(db, stats) : null));
       await socket.close().catch(() => {});
     }
   }
