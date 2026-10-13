@@ -27,7 +27,15 @@ staging の Worker (vein / leave / dtako / trouble / notify / lineworks) が共�
 起動の順は `src/steps.js` の `setupSteps`。build 時の `scripts/gen-prebuilt-wasm.mjs` も同じものを node で 1 回通して検査する
 (片方だけ変えない)。起動に成功すると 1 行だけ出す:
 `{"staging_db":"ready","rev":"<先頭 7 桁>","migrations":<本数>,"ms":<所要>}`。エラーは `{"staging_db":"error","at":…,"kind":…}`
-(固定の語と原因の種類だけ。入力値・SQL・tenant_id は出さない)。
+(固定の語と原因の種類だけ。入力値・SQL・tenant_id は出さない)。接続の中のエラーには段 `step`
+(`frame` / `start` / `exec` / `role` / `write`) が付く。利用側が Terminate を送らずに切った接続 (tokio-postgres の Client を
+drop したまま invocation が終わる形。read が TypeError「client disconnected」で落ちる) はエラーにせず、通常の終了として扱う。
+
+**診断ログ (白黒が付いたら別 PR で削る)**: 「取り込んだページが見えない」の切り分け用 (Refs ohishi-exp/rust-leave-worker#1)。
+DO の起動で `{"staging_db":"boot","inst":…}`、ready に `inst` (DO のインスタンスの印) と `gen` (PGlite を作った回数)、
+接続ごとに終わるとき 1 行 `{"staging_db":"conn","inst","gen","seq","wait_ms","msgs":{種別:件数},"tags":[CommandComplete の tag],
+"errors":[SQLSTATE],"rfq":"I|T|E","end":"terminate|disconnect|idle|eof|error","rolled_back","pages":<leave_pages の全 tenant の総数>}`。
+`pages` は終了処理 (ROLLBACK・RESET) の後に superuser に戻して数え、失敗したら `null`。
 
 ## 接続
 
