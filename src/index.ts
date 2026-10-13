@@ -25,7 +25,7 @@ import dataDir from "../.prebuilt/datadir.tar.gz";
 // scripts/fetch-migrations.sh が ALC_MIGRATIONS_REV の版から作る (commit しない)
 import bundle from "../.alc-migrations/bundle.json";
 import { PGLITE_INITIAL_MIB, POSTGRESQL_CONF, RUNTIME_ROLE, setupSteps } from "./steps.js";
-import { ConnStats } from "./diag";
+import { ConnStats, type Snapshot } from "./diag";
 import { installWasmShim } from "./wasm-shim";
 
 const SSL_REQUEST = 80877103;
@@ -127,15 +127,36 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
 
 const IDLE = Symbol("idle");
 
-/// 診断用: leave_pages の全 tenant の総数 (件数だけ)。接続の終了処理 (ROLLBACK・RESET) の後に superuser に戻して数える
-/// (PGlite では RESET SESSION AUTHORIZATION が効かないため名指しで戻す。次の接続は頭で alc_api_rt にし直す)。
+/// 診断用: 接続の終了処理 (ROLLBACK・RESET) の後に superuser に戻して leave_pages を数える (件数・種類数・秒だけ)。
+/// PGlite では RESET SESSION AUTHORIZATION が効かないため名指しで戻す。次の接続は頭で alc_api_rt にし直す。
 /// 失敗しても null を返すだけで、終了処理を止めない
-async function countPages(db: PGlite): Promise<number | null> {
+async function snapshot(db: PGlite, stats: ConnStats): Promise<Snapshot | null> {
   try {
     if (db.isInTransaction()) return null;
     await db.exec("SET SESSION AUTHORIZATION postgres");
-    const r = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM alc_api.leave_pages");
-    return r.rows[0]?.n ?? null;
+    const r = await db.query<{ n: number; t: number; young: number | null; old: number | null }>(
+      `SELECT count(*)::int AS n, count(DISTINCT tenant_id)::int AS t,
+              floor(extract(epoch FROM now() - max(received_at)))::int AS young,
+              floor(extract(epoch FROM now() - min(received_at)))::int AS old
+         FROM alc_api.leave_pages`,
+    );
+    const row = r.rows[0];
+    if (!row) return null;
+    // Bind で届いた uuid ごとに、その値の tenant_id の行が在るか (値は出さない)
+    const inPages: boolean[] = [];
+    for (const u of stats.bindUuids()) {
+      const e = await db.query<{ e: boolean }>(
+        "SELECT EXISTS (SELECT 1 FROM alc_api.leave_pages WHERE tenant_id = $1::uuid) AS e",
+        [u],
+      );
+      inPages.push(e.rows[0]?.e === true);
+    }
+    return {
+      pages: row.n,
+      tenants: row.t,
+      received_age_s: row.young === null ? [] : [row.young, row.old ?? row.young],
+      bind_uuid_in_pages: inPages,
+    };
   } catch {
     return null;
   }
@@ -288,7 +309,7 @@ export class StagingDb extends DurableObject {
       } catch (e) {
         logError("reset", e);
       }
-      console.log(stats.line(this.inst, this.gen, db ? await countPages(db) : null));
+      console.log(stats.line(this.inst, this.gen, db ? await snapshot(db, stats) : null));
       await socket.close().catch(() => {});
     }
   }

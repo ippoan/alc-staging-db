@@ -34,8 +34,11 @@ drop したまま invocation が終わる形。read が TypeError「client disco
 **診断ログ (白黒が付いたら別 PR で削る)**: 「取り込んだページが見えない」の切り分け用 (Refs ohishi-exp/rust-leave-worker#1)。
 DO の起動で `{"staging_db":"boot","inst":…}`、ready に `inst` (DO のインスタンスの印) と `gen` (PGlite を作った回数)、
 接続ごとに終わるとき 1 行 `{"staging_db":"conn","inst","gen","seq","wait_ms","msgs":{種別:件数},"tags":[CommandComplete の tag],
-"errors":[SQLSTATE],"rfq":"I|T|E","end":"terminate|disconnect|idle|eof|error","rolled_back","pages":<leave_pages の全 tenant の総数>}`。
-`pages` は終了処理 (ROLLBACK・RESET) の後に superuser に戻して数え、失敗したら `null`。
+"errors":[SQLSTATE],"rfq":"I|T|E","end":"terminate|disconnect|idle|eof|error","rolled_back","bind_ts_age_s":[…],"pages",
+"tenants","received_age_s":[最小,最大],"bind_uuid_in_pages":[…]}`。
+`pages` (leave_pages の全 tenant の総数)・`tenants` (tenant_id の種類数)・`received_age_s` (now() − received_at の秒) は終了処理
+(ROLLBACK・RESET) の後に superuser に戻して数え、失敗したら `pages: null`。`bind_ts_age_s` は Bind で届いた時刻の引数の now − 値 (秒)、
+`bind_uuid_in_pages` は Bind で届いた uuid の引数ごとに「その値の tenant_id の行が leave_pages に在るか」(値はログに出さない)。
 
 ## 接続
 
