@@ -1,6 +1,6 @@
 # alc-staging-db
 
-staging の Worker (vein / leave / dtako / trouble / notify / lineworks) が共用する Postgres。
+staging の Worker (STAGING_DB の binding を持つのは alc-auth-worker と rust-leave-worker の 2 つだけ) が共用する Postgres。
 **Durable Object `StagingDb` の中で PGlite** (@electric-sql/pglite、postgres の wasm 版) を動かし、Worker から `Stub::connect`
 で届いた TCP の生バイトを postgres の wire protocol としてそのまま PGlite へ流す。Refs ohishi-exp/rust-leave-worker#1
 
@@ -20,7 +20,7 @@ staging の Worker (vein / leave / dtako / trouble / notify / lineworks) が共�
                                                   PGlite (wasm、DO の isolate の中)
                                                     - 最初の接続で起動: 同梱の datadir を loadDataDir
                                                       → init_local_db → _sqlx_migrations → migration 全量
-                                                      → local_app_grants → staging 専用の SQL
+                                                      → local_app_grants
                                                     - 接続の頭で SET SESSION AUTHORIZATION alc_api_rt
 ```
 
@@ -42,21 +42,11 @@ drop したまま invocation が終わる形。read が TypeError「client disco
   (実測: 次の接続の current_user = alc_api_rt、未 commit の BEGIN は ROLLBACK 済み)。
   postgres の session は DO の中で 1 本なので、`RESET` で消えない session の状態 (定義済みの GUC 等) は次の接続に持ち越される
 
-## staging 専用の SQL (会社の行を自動で作る)
+## 会社 (tenants) の行
 
-staging の利用者の tenant_id は揮発する (DB が起きるたびに空) ので固定値を持てない。migration の後に、この repo の起動 SQL として
-(`src/steps.js` の `STAGING_SQL`。alc-migrations には入れない):
-
-- 関数 `alc_api.staging_ensure_tenant()` (trigger、`SECURITY DEFINER`、`SET search_path = alc_api`、所有者は起動を流す superuser):
-  `NEW.tenant_id` が tenants に無ければ `(id, name) = (NEW.tenant_id, 'staging')` の行を作る
-- `alc_api.tenants(id)` を指す外部キーを持つ alc_api の表すべてに
-  `BEFORE INSERT OR UPDATE OF tenant_id … FOR EACH ROW` で張る (rev 39e5183 で 71 表)。
-  tenant_id 以外の列の外部キーが見つかったら起動を失敗させる
-
-⇒ 利用側は tenants に無い tenant_id のまま leave_settings・users 等へ書いてよい (外部キー違反にならない)。
-
-staging の利用者の tenant_id は揮発する (rust-alc-api staging の DB 次第)。機械用資格情報は発行時の tenant に紐づくので、
-利用者の tenant が変わったら発行し直す (古い tenant のまま取り込むと、行は入るが今の利用者の一覧には出ない)。
+会社はログインのとき alc-auth-worker (STAGING_MODE) が作る。DO は起きるたびに空なので、DO 再起動直後に古い JWT で書くと
+会社が無く外部キー違反になる。その場合は再ログインする。機械用資格情報は発行時の tenant に紐づくので、利用者の tenant が
+変わったら発行し直す。
 
 ## connect 口の認可
 
@@ -86,7 +76,7 @@ script_name = "alc-staging-db-staging"
 
 `ALC_MIGRATIONS_REV` の 1 行 (ippoan/alc-migrations の commit SHA) だけを書き換える。`wrangler.toml` の `[build]` が
 `scripts/fetch-migrations.sh` でその版を取り (写しは commit しない)、`scripts/gen-prebuilt-wasm.mjs` が node で
-起動 → migration 全量 → staging 専用の SQL → alc_api_rt での書き・読み (RLS) を 1 回通す。CI の dry-run が通れば、merge で
+起動 → migration 全量 → alc_api_rt での書き・読み (RLS) を 1 回通す。CI の dry-run が通れば、merge で
 staging へ配信される。今の版は 39e5183 (migration 177 まで。001〜177 のうち 133 は欠番で 176 本)。
 
 ## 128 MB に収めるために
