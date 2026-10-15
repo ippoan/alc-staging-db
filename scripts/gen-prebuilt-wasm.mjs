@@ -9,7 +9,7 @@
 //    PGlite (Emscripten) は起動と migration の途中で 2 種類の wasm を bytes からコンパイルする:
 //      - `addFunction` が JS の関数を関数表に入れるために作る、シグネチャごとの小さな module
 //      - pglite.data の中の拡張 (dict_snowball.so・plpgsql.so 等の side module) を dlopen するとき
-//    node で DO と同じ流れ (1 の版と 2 の datadir で起動 → migration 全量 → staging 専用の SQL → RLS 付きの書き・読み) を 1 回通して
+//    node で DO と同じ流れ (1 の版と 2 の datadir で起動 → migration 全量 → RLS 付きの書き・読み) を 1 回通して
 //    その bytes を捕まえ、.prebuilt/ に
 //    .wasm として書き出す (bundle に CompiledWasm で入る)。実行時は src/wasm-shim.ts が、同じ bytes のコンパイルを同梱のものに差し替える
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -107,18 +107,12 @@ await maker.close();
 
 const db = await PGlite.create({ ...base, loadDataDir: new Blob([dataDir]) });
 for (const step of setupSteps(bundle)) await db.exec(step.sql);
-// staging 専用の SQL の検査: tenants を指す外部キーを持つ表の数だけ trigger が在る
-const { rows: [tg] } = await db.query(`
-  SELECT (SELECT count(DISTINCT c.conrelid)::int FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
-           WHERE c.contype = 'f' AND c.confrelid = 'alc_api.tenants'::regclass
-             AND t.relnamespace = 'alc_api'::regnamespace AND c.conparentid = 0) AS fk_tables,
-         (SELECT count(*)::int FROM pg_trigger WHERE tgname = 'staging_ensure_tenant' AND tgparentid = 0) AS triggers`);
-if (tg.fk_tables === 0 || tg.fk_tables !== tg.triggers) throw new Error(`trigger の数が違う: ${JSON.stringify(tg)}`);
-// 実行用ロールで、tenants に無い 2 つの tenant_id の乗務員を書き (trigger が会社の行を作る)、
-// それぞれのテナントから自分の 1 行だけが見えることを確かめる (RLS)。書いたものは捨てる
+// 実行用ロールで書くには会社の行が要る (ログインのとき alc-auth-worker が作るのと同じ)。build 時の superuser のまま 2 社作る
+const ids = [crypto.randomUUID(), crypto.randomUUID()];
+await db.query("INSERT INTO alc_api.tenants (id, name) VALUES ($1, 'rls-check-a'), ($2, 'rls-check-b')", ids);
+// 実行用ロールで、それぞれのテナントの乗務員を書き、それぞれのテナントから自分の 1 行だけが見えることを確かめる (RLS)。書いたものは捨てる
 await db.exec(`SET SESSION AUTHORIZATION ${RUNTIME_ROLE}`);
 const seen = await db.transaction(async (tx) => {
-  const ids = [crypto.randomUUID(), crypto.randomUUID()];
   for (const id of ids) {
     await tx.query("SELECT set_config('app.current_tenant_id', $1, true)", [id]);
     await tx.query("INSERT INTO alc_api.employees (tenant_id, name) VALUES ($1, 'build-check')", [id]);
@@ -152,6 +146,5 @@ writeFileSync(
 const total = keys.reduce((n, k) => n + captured.get(k).length, 0);
 console.log(
   `pglite.wasm の memory の最小を ${patched.from} → ${PGLITE_INITIAL_MIB * 16} pages に書き換え、` +
-    `空の datadir (gzip ${dataDir.length} bytes)・実行時にコンパイルされる wasm ${keys.length} 個 (${total} bytes) と一緒に .prebuilt/ に書き出した` +
-    ` (staging_ensure_tenant の trigger ${tg.triggers} 本)`,
+    `空の datadir (gzip ${dataDir.length} bytes)・実行時にコンパイルされる wasm ${keys.length} 個 (${total} bytes) と一緒に .prebuilt/ に書き出した`,
 );
